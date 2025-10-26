@@ -1,0 +1,326 @@
+Attribute VB_Name = "Module1"
+Sub CreateBorrowingDurationSimulationSheet()
+    ' 借入金の調達時デュレーションシミュレーション用Excelシートの作成 (InputBox簡易入力版、C2満期年数/C3調整後計算デュレーション表示)
+    ' 元本均等返済、月次。逆算モードで二分法を使う
+    
+    Dim ws As Worksheet
+    Dim baseName As String
+    Dim uniqueName As String
+    Dim N_years As Double
+    Dim N_months As Integer
+    Dim t As Integer
+    Dim rowStart As Integer
+    Dim i As Integer
+    Dim outputRow As Integer
+    Dim principal As Double
+    Dim targetDuration As Double
+    Dim mode As String
+    Dim rate As Double
+    Dim calcRate As Double  ' 逆算結果用変数
+    Dim calcDuration As Double  ' 計算デュレーション用変数
+    
+    On Error GoTo ErrorHandler  ' 全体エラー捕捉
+    
+    ' InputBoxで入力値取得 (順次ダイアログ、デフォルト変更)
+    principal = GetInputValue("借入額 (Principal)", "1000000000", True)  ' 変更: 1000000000
+    If principal = -1 Then Exit Sub  ' キャンセル
+    
+    N_years = GetInputValue("満期年数 (Years)", "4", True)
+    If N_years = -1 Then Exit Sub
+    
+    targetDuration = GetInputValue("目標デュレーション (Years)", "2", True)
+    If targetDuration = -1 Then Exit Sub
+    
+    mode = GetInputValue("計算モード (直接計算 or 逆算)", "逆算", False)  ' 文字列
+    If mode = "" Then Exit Sub
+    
+    rate = GetInputValue("利率 (Rate, 年率, 例: 0.016)", "0.016", True)  ' 変更: 0.016
+    If rate = -1 Then Exit Sub
+    
+    ' 新しいシートを作成 (一時名で追加)
+    Set ws = ActiveWorkbook.Worksheets.Add(After:=ActiveWorkbook.Sheets(ActiveWorkbook.Sheets.Count))
+    ws.Name = "TempSheet"  ' 一時名 (後で変更)
+    baseName = "借入デュレーションシミュレーション"
+    
+    ' シート追加後のカウントで重複チェック
+    uniqueName = GetUniqueSheetName(baseName, ws)  ' wsを渡して直接リネーム試行
+    ws.Name = uniqueName  ' リネーム
+    ws.Activate
+    
+    ' 入力値から入力エリア設定 (B5に常にINPUT値 rate を表示)
+    ws.Range("B1").Value = principal
+    ws.Range("B2").Value = N_years
+    ws.Range("B3").Value = targetDuration
+    ws.Range("B4").Value = mode
+    ws.Range("B5").Value = rate  ' 常に入力値を表示
+    
+    ' 入力エリアのラベルとフォーマット
+    ws.Range("A1").Value = "借入額 (Principal)"
+    ws.Range("A2").Value = "満期年数 (Years)"
+    ws.Range("A3").Value = "目標デュレーション (Years)"
+    ws.Range("A4").Value = "計算モード"
+    ws.Range("A5").Value = "利率 (Rate, 年率)"
+    ws.Range("B1").NumberFormat = "#,##0"
+    ws.Range("B2").NumberFormat = "0"
+    ws.Range("B3").NumberFormat = "0.00"
+    ws.Range("B5").NumberFormat = "0.00%"
+    ws.Range("A1:A5").Font.Bold = True
+    ws.Range("A1:B5").Borders.LineStyle = xlContinuous
+    
+    ' C2に満期年数を表示 (常に)
+    ws.Range("C2").Value = "計算満期年数: " & Format(N_years, "0") & "年"
+    ws.Range("C2").Font.Bold = True  ' 太字で目立たせ
+    
+    ' 満期月数計算
+    N_months = CInt(N_years * 12)
+    ws.Range("B6").Value = N_months  ' 補助: 総月数
+    ws.Range("A6").Value = "総月数"
+    
+    ' 逆算/直接計算共通の計算デュレーション計算 (調整後値)
+    If mode = "逆算" Then
+        calcRate = BisectionSolveForRate(ws)
+        ws.Range("C5").Value = "逆算結果: " & Format(calcRate, "0.00%")  ' C列に表示
+        ws.Range("C5").Font.Bold = True  ' 太字で目立たせ
+        calcDuration = CalculateDuration(principal, calcRate, N_years)  ' 逆算rateで計算
+    Else
+        ws.Range("C5").Value = ""  ' 直接計算時はC5空
+        calcDuration = CalculateDuration(principal, rate, N_years)  ' 入力rateで計算
+    End If
+    
+    ' 計算デュレーションをC3に表示 (逆算/直接計算共通、調整後値)
+    ws.Range("C3").Value = "計算デュレーション: " & Format(calcDuration, "0.00") & "年"
+    ws.Range("C3").Font.Bold = True  ' 太字で目立たせ
+    
+    ' 計算テーブルのヘッダー (行8)
+    ws.Range("A8").Value = "月 (t)"
+    ws.Range("B8").Value = "残存元本"
+    ws.Range("C8").Value = "月次利息"
+    ws.Range("D8").Value = "月次元本"
+    ws.Range("E8").Value = "キャッシュフロー"
+    ws.Range("F8").Value = "割引係数"
+    ws.Range("G8").Value = "PV"
+    ws.Range("H8").Value = "t*PV"
+    ws.Range("A8:H8").Font.Bold = True
+    ws.Range("A8:H8").HorizontalAlignment = xlCenter
+    ws.Range("A8:H8").Borders.LineStyle = xlContinuous
+    
+    rowStart = 9
+    
+    ' 計算テーブルの行を動的に生成 (エラー捕捉 + 絶対参照で最適化)
+    On Error Resume Next
+    For t = 1 To N_months
+        i = rowStart + t - 1
+        
+        ws.Range("A" & i).Value = t
+        
+        If t = 1 Then
+            ws.Range("B" & i).Value = principal
+        Else
+            ws.Range("B" & i).Formula = "=B" & (i - 1) & " - D9"  ' 固定D9参照 (rowStart=9固定)
+        End If
+        
+        ws.Range("C" & i).Formula = "=B" & i & " * ($B$5 / 12)"
+        ws.Range("D" & i).Formula = "=B$1 / B$6"
+        ws.Range("E" & i).Formula = "=C" & i & " + D" & i
+        ws.Range("F" & i).Formula = "=(1 + ($B$5 / 12))^(-A" & i & ")"
+        ws.Range("G" & i).Formula = "=E" & i & " * F" & i
+        ws.Range("H" & i).Formula = "=A" & i & " * G" & i
+        
+        If Err.Number <> 0 Then
+            MsgBox "テーブル生成エラー (行 " & i & "): " & Err.Description & vbCrLf & "満期年数を短くしてください。", vbCritical
+            Err.Clear
+            On Error GoTo 0
+            Exit For
+        End If
+    Next t
+    On Error GoTo ErrorHandler
+    
+    ' テーブル範囲のフォーマット (割引係数F列以外を#,##0形式)
+    ws.Range("A8:H" & (rowStart + N_months - 1)).Borders.LineStyle = xlContinuous
+    ws.Range("B9:E" & (rowStart + N_months - 1)).NumberFormat = "#,##0"  ' B-E: カンマ区切り整数
+    ws.Range("G9:H" & (rowStart + N_months - 1)).NumberFormat = "#,##0"  ' G-H: カンマ区切り整数
+    ws.Range("F9:F" & (rowStart + N_months - 1)).NumberFormat = "0.0000"  ' F: 割引係数、小数4桁
+    
+    ' 出力エリア (コメントアウト)
+    ' outputRow = rowStart + N_months + 2
+    ' ws.Range("A" & outputRow).Value = "借入額 (総PV)"
+    ' ws.Range("B" & outputRow).Formula = "=SUM(G" & rowStart & ":G" & (rowStart + N_months - 1) & ")"
+    ' ws.Range("A" & (outputRow + 1)).Value = "計算デュレーション (年)"
+    ' ws.Range("B" & (outputRow + 1)).Formula = "=SUM(H" & rowStart & ":H" & (rowStart + N_months - 1) & ") / B" & outputRow & " / 12"
+    
+    ' 出力フォーマット (コメントアウト)
+    ' ws.Range("A" & outputRow & ":A" & (outputRow + 1)).Font.Bold = True
+    ' ws.Range("B" & outputRow).NumberFormat = "#,##0"  ' 総PV: カンマ区切り
+    ' ws.Range("B" & (outputRow + 1)).NumberFormat = "0.00"  ' デュレーション: 小数2桁
+    ' ws.Range("A" & outputRow & ":B" & (outputRow + 1)).Borders.LineStyle = xlContinuous
+    
+    ' 列幅調整
+    ws.Columns("A:H").AutoFit
+    ws.Rows("1:8").RowHeight = 18
+    
+    ' 計算後出力
+    ws.Calculate  ' 数式更新
+    MsgBox "シート '" & uniqueName & "' が作成されました!" & vbCrLf & _
+           "逆算モード時は二分法で自動計算。入力変更で再実行してください。" & vbCrLf & _
+           "計算デュレーション: " & Format(calcDuration, "0.00") & "年", vbInformation
+    Exit Sub
+    
+ErrorHandler:
+    MsgBox "全体エラー: " & Err.Description & vbCrLf & "VBAを再起動して試してください。", vbCritical
+End Sub
+
+Function GetInputValue(prompt As String, defaultValue As String, isNumeric As Boolean) As Variant
+    ' InputBoxラッパー: 入力値取得 + 検証 (Val使用でIsNumeric回避)
+    Dim inputVal As String
+    Dim numVal As Double
+    
+    Do
+        inputVal = InputBox(prompt & vbCrLf & "デフォルト: " & defaultValue, "入力", defaultValue)
+        
+        If inputVal = "" Then  ' キャンセル
+            GetInputValue = -1
+            Exit Function
+        End If
+        
+        If isNumeric Then
+            numVal = Val(inputVal)  ' IsNumeric代替: Valで数値変換試行
+            If numVal <> 0 Or inputVal = "0" Then  ' 0も含め有効
+                If numVal > 0 Then  ' 正の数のみ
+                    GetInputValue = numVal
+                    Exit Function
+                Else
+                    MsgBox "正の数値を入力してください。", vbExclamation
+                End If
+            Else
+                MsgBox "数値を入力してください。", vbExclamation
+            End If
+        Else  ' 文字列 (モード用)
+            If inputVal = "直接計算" Or inputVal = "逆算" Then
+                GetInputValue = inputVal
+                Exit Function
+            Else
+                MsgBox "直接計算 または 逆算 を入力してください。", vbExclamation
+            End If
+        End If
+    Loop
+End Function
+
+Function GetUniqueSheetName(baseName As String, targetWs As Worksheet) As String
+    ' 重複しないシート名を生成 (On Errorでリネーム試行のみ、ループなし)
+    Dim i As Integer
+    Dim testName As String
+    Dim errNum As Long
+    
+    testName = baseName
+    i = 1
+    
+    Do While True
+        On Error Resume Next
+        targetWs.Name = testName  ' 直接試行
+        errNum = Err.Number
+        On Error GoTo 0
+        
+        If errNum = 0 Then  ' 成功 (重複なし)
+            GetUniqueSheetName = testName
+            Exit Function
+        End If
+        
+        testName = baseName & " (" & i & ")"
+        i = i + 1
+        If i > 5 Then  ' 短く制限
+            testName = baseName & "_New"
+            targetWs.Name = testName  ' 強制設定
+            GetUniqueSheetName = testName
+            Exit Function
+        End If
+    Loop
+End Function
+
+Function BisectionSolveForRate(ws As Worksheet) As Double
+    ' 二分法で目標デュレーションから利率を逆算
+    Dim low As Double, high As Double
+    Dim mid As Double
+    Dim target As Double
+    Dim dur_low As Double, dur_high As Double
+    Dim tolerance As Double
+    Dim max_iter As Integer
+    Dim iter As Integer
+    Dim principal As Double, years As Double
+    Dim dur_mid As Double
+    
+    principal = ws.Range("B1").Value
+    years = ws.Range("B2").Value
+    target = ws.Range("B3").Value
+    tolerance = 1E-05
+    max_iter = 100
+    
+    low = 0
+    high = 0.2
+    
+    dur_low = CalculateDuration(principal, low, years)
+    dur_high = CalculateDuration(principal, high, years)
+    
+    If dur_low < target Or dur_high > target Then
+        BisectionSolveForRate = 0.016  ' デフォルト値 (変更: 0.016)
+        Exit Function
+    End If
+    
+    For iter = 1 To max_iter
+        mid = (low + high) / 2
+        dur_mid = CalculateDuration(principal, mid, years)
+        
+        If Abs(dur_mid - target) < tolerance Then
+            BisectionSolveForRate = mid
+            Exit Function
+        End If
+        
+        If dur_mid > target Then
+            low = mid
+        Else
+            high = mid
+        End If
+    Next iter
+    
+    BisectionSolveForRate = mid
+End Function
+
+Function CalculateDuration(principal As Double, rate As Double, years As Double) As Double
+    ' 元本均等返済のマコーレイ・デュレーション計算 (月次)
+    Dim months As Integer
+    Dim monthly_rate As Double
+    Dim monthly_principal As Double
+    Dim weighted As Double
+    Dim price As Double
+    Dim remaining As Double
+    Dim t As Integer
+    Dim interest As Double
+    Dim cf As Double
+    Dim pv As Double
+    
+    months = CInt(years * 12)
+    If months = 0 Then
+        CalculateDuration = 0
+        Exit Function
+    End If
+    monthly_rate = rate / 12
+    monthly_principal = principal / months
+    weighted = 0
+    price = 0
+    remaining = principal
+    
+    For t = 1 To months
+        interest = remaining * monthly_rate
+        cf = interest + monthly_principal
+        pv = cf / (1 + monthly_rate) ^ t
+        weighted = weighted + t * pv
+        price = price + pv
+        remaining = remaining - monthly_principal
+    Next t
+    
+    If price > 0 Then
+        CalculateDuration = (weighted / price) / 12
+    Else
+        CalculateDuration = 0
+    End If
+End Function
+
